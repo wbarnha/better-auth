@@ -9,4 +9,6 @@ Add `advanced.useHostCookiePrefix` to emit auth cookies with the `__Host-` prefi
 
 Previously, setting `advanced.cookiePrefix` to a string starting with `__Host-` just concatenated it after the hardcoded `__Secure-` prefix (e.g. `__Secure-__Host-myapp.session_token`), so the browser never enforced `__Host-`'s guarantees.
 
+`getSessionCookie` and `getCookieCache` (the standalone helpers used in middleware) auto-detect a `__Host-` cookie with no config changes required, the same way they already handle `__Secure-`.
+
 Turning this on renames every auth cookie, which signs out existing sessions — treat it as a breaking, opt-in change.

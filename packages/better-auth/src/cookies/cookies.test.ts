@@ -21,6 +21,7 @@ import {
 	vi,
 } from "vitest";
 import {
+	createCookieGetter,
 	expireCookie,
 	getChunkedCookie,
 	getCookieCache,
@@ -272,7 +273,47 @@ describe("useHostCookiePrefix", () => {
 					},
 				},
 			} satisfies BetterAuthOptions),
-		).toThrow(/cannot use the __Host- prefix/);
+		).toThrow(
+			/advanced\.cookies\.session_token\.attributes cannot set a Domain attribute/,
+		);
+	});
+
+	it("throws eagerly for a plugin-only cookie's attributes, not just at first use", () => {
+		// "trust_device" isn't created by getCookies() itself (it's created
+		// lazily by the two-factor plugin on first sign-in) — this proves the
+		// bad config is caught at startup rather than surfacing as an
+		// uncaught error mid-request the first time that cookie is created.
+		expect(() =>
+			createCookieGetter({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					cookies: {
+						trust_device: {
+							attributes: { domain: "example.com" },
+						},
+					},
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(
+			/advanced\.cookies\.trust_device\.attributes cannot set a Domain attribute/,
+		);
+	});
+
+	it("throws eagerly when defaultCookieAttributes overrides domain or path", () => {
+		expect(() =>
+			createCookieGetter({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					defaultCookieAttributes: { path: "/app" },
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(
+			/advanced\.defaultCookieAttributes cannot set a Domain attribute/,
+		);
 	});
 });
 
@@ -816,19 +857,28 @@ describe("getSessionCookie", async () => {
 			headers,
 		});
 
-		// Without isHostPrefix, the cache is not found under its __Host- name.
-		const missed = await getCookieCache(request, {
+		// Zero-config: auto-detects the __Host- name, same as getSessionCookie.
+		const autoDetected = await getCookieCache(request, {
 			secret: "better-auth.secret",
 		});
-		expect(missed).toBeNull();
+		expect(autoDetected).not.toBeNull();
+		expect(autoDetected?.user?.email).toEqual(testUser.email);
 
-		const cache = await getCookieCache(request, {
+		// isHostPrefix still forces it explicitly.
+		const forced = await getCookieCache(request, {
 			secret: "better-auth.secret",
 			isSecure: true,
 			isHostPrefix: true,
 		});
-		expect(cache).not.toBeNull();
-		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(forced).not.toBeNull();
+		expect(forced?.user?.email).toEqual(testUser.email);
+
+		// isSecure: false still opts out of any prefix, even if one is present.
+		const optedOut = await getCookieCache(request, {
+			secret: "better-auth.secret",
+			isSecure: false,
+		});
+		expect(optedOut).toBeNull();
 	});
 
 	it("should respect dontRememberMe when storing session in cookie cache", async () => {

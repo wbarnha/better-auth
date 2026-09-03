@@ -110,6 +110,29 @@ export function createCookieGetter(options: BetterAuthOptions) {
 			"baseURL is required when crossSubdomainCookies are enabled.",
 		);
 	}
+	if (secureCookiePrefix === HOST_COOKIE_PREFIX) {
+		// Validate every statically-known attribute override up front, since
+		// plugin cookies (e.g. two-factor's trust_device) are only created
+		// lazily on first use — deferring this to createCookie() would let a
+		// bad config boot cleanly and then throw uncaught mid-request.
+		const violatesHostRequirements = (attrs?: CookieOptions) =>
+			!!attrs &&
+			(attrs.domain || (attrs.path !== undefined && attrs.path !== "/"));
+		if (violatesHostRequirements(options.advanced?.defaultCookieAttributes)) {
+			throw new BetterAuthError(
+				"advanced.defaultCookieAttributes cannot set a Domain attribute or a Path other than / when advanced.useHostCookiePrefix is enabled.",
+			);
+		}
+		for (const [cookieName, cookieConfig] of Object.entries(
+			options.advanced?.cookies ?? {},
+		)) {
+			if (violatesHostRequirements(cookieConfig?.attributes)) {
+				throw new BetterAuthError(
+					`advanced.cookies.${cookieName}.attributes cannot set a Domain attribute or a Path other than / when advanced.useHostCookiePrefix is enabled.`,
+				);
+			}
+		}
+	}
 	function createCookie(
 		cookieName: string,
 		overrideAttributes: Partial<CookieOptions> = {},
@@ -672,18 +695,30 @@ export const getCookieCache = async <
 	}
 	const { cookieName = "session_data", cookiePrefix = "better-auth" } =
 		config || {};
-	const securePrefix = config?.isHostPrefix
-		? HOST_COOKIE_PREFIX
-		: SECURE_COOKIE_PREFIX;
-	const name =
-		config?.isSecure !== undefined
-			? config.isSecure
-				? `${securePrefix}${cookiePrefix}.${cookieName}`
-				: `${cookiePrefix}.${cookieName}`
-			: isProduction
-				? `${securePrefix}${cookiePrefix}.${cookieName}`
-				: `${cookiePrefix}.${cookieName}`;
+	const bareName = `${cookiePrefix}.${cookieName}`;
 	const parsedCookie = parseCookies(cookies);
+	const hasCookieNamed = (candidate: string) =>
+		parsedCookie.has(candidate) ||
+		Array.from(parsedCookie.keys()).some((k) => k.startsWith(`${candidate}.`));
+
+	let name: string;
+	if (config?.isSecure === false) {
+		name = bareName;
+	} else if (config?.isHostPrefix) {
+		name = `${HOST_COOKIE_PREFIX}${bareName}`;
+	} else if (hasCookieNamed(`${HOST_COOKIE_PREFIX}${bareName}`)) {
+		// Auto-detect a __Host- cookie (e.g. advanced.useHostCookiePrefix)
+		// without requiring the caller to pass isHostPrefix explicitly —
+		// mirrors getSessionCookie's prefix auto-detection.
+		name = `${HOST_COOKIE_PREFIX}${bareName}`;
+	} else if (
+		config?.isSecure === true ||
+		hasCookieNamed(`${SECURE_COOKIE_PREFIX}${bareName}`)
+	) {
+		name = `${SECURE_COOKIE_PREFIX}${bareName}`;
+	} else {
+		name = isProduction ? `${SECURE_COOKIE_PREFIX}${bareName}` : bareName;
+	}
 
 	// Check for chunked cookies
 	let sessionData = parsedCookie.get(name);
