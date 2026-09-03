@@ -8,6 +8,7 @@ import { APIError, sessionMiddleware } from "../../api";
 import {
 	deleteSessionCookie,
 	expireCookie,
+	HOST_COOKIE_PREFIX,
 	parseCookies,
 	parseSetCookieHeader,
 	SECURE_COOKIE_PREFIX,
@@ -56,6 +57,11 @@ export const multiSession = (options?: MultiSessionConfig | undefined) => {
 	};
 
 	const isMultiSessionCookie = (key: string) => key.includes("_multi-");
+	const restoreSecurePrefixCasing = (key: string) =>
+		key
+			.toLowerCase()
+			.replace(SECURE_COOKIE_PREFIX.toLowerCase(), SECURE_COOKIE_PREFIX)
+			.replace(HOST_COOKIE_PREFIX.toLowerCase(), HOST_COOKIE_PREFIX);
 
 	return {
 		id: "multi-session",
@@ -392,12 +398,7 @@ export const multiSession = (options?: MultiSessionConfig | undefined) => {
 									);
 									if (verifiedToken) {
 										expireCookie(ctx, {
-											name: key
-												.toLowerCase()
-												.replace(
-													SECURE_COOKIE_PREFIX.toLowerCase(),
-													SECURE_COOKIE_PREFIX,
-												),
+											name: restoreSecurePrefixCasing(key),
 											attributes:
 												ctx.context.authCookies.sessionToken.attributes,
 										});

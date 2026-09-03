@@ -166,6 +166,116 @@ describe("cookies", async () => {
 	});
 });
 
+describe("useHostCookiePrefix", () => {
+	it("emits __Host- prefixed cookies instead of __Secure-", async () => {
+		const { client, testUser } = await getTestInstance({
+			baseURL: "https://example.com",
+			advanced: { useHostCookiePrefix: true },
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toContain(
+						`${HOST_COOKIE_PREFIX}better-auth.session_token`,
+					);
+					expect(setCookie).not.toContain(SECURE_COOKIE_PREFIX);
+					expect(setCookie).toContain("Secure");
+					expect(setCookie).toContain("Path=/");
+					expect(setCookie).not.toContain("Domain=");
+				},
+			},
+		);
+	});
+
+	it("is readable via getSessionCookie", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			baseURL: "https://example.com",
+			advanced: { useHostCookiePrefix: true },
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{ email: testUser.email, password: testUser.password },
+			{ onSuccess: cookieSetter(headers) },
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		expect(getSessionCookie(request)).not.toBeNull();
+	});
+
+	it("throws when useSecureCookies is explicitly disabled", () => {
+		expect(() =>
+			getCookies({
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					useSecureCookies: false,
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(/cannot be combined with advanced\.useSecureCookies: false/);
+	});
+
+	it("degrades to no prefix (instead of throwing) when secure is only inferred false, e.g. local http dev", async () => {
+		const { client, testUser } = await getTestInstance({
+			advanced: { useHostCookiePrefix: true },
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).not.toContain(HOST_COOKIE_PREFIX);
+					expect(setCookie).not.toContain(SECURE_COOKIE_PREFIX);
+					expect(setCookie).toContain("better-auth.session_token");
+				},
+			},
+		);
+	});
+
+	it("throws when combined with crossSubDomainCookies", () => {
+		expect(() =>
+			getCookies({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					crossSubDomainCookies: {
+						enabled: true,
+						domain: "example.com",
+					},
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(/cannot be combined with advanced\.crossSubDomainCookies/);
+	});
+
+	it("throws when a cookie overrides domain or path", () => {
+		expect(() =>
+			getCookies({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					cookies: {
+						session_token: {
+							attributes: { path: "/app" },
+						},
+					},
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(/cannot use the __Host- prefix/);
+	});
+});
+
 describe("crossSubdomainCookies", () => {
 	it("should update cookies with custom domain", async () => {
 		const { client, testUser } = await getTestInstance({
@@ -676,6 +786,49 @@ describe("getSessionCookie", async () => {
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual(testUser.email);
 		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+
+	it("should return cookie cache stored under a __Host- prefixed cookie", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			baseURL: "https://example.com",
+			secret: "better-auth.secret",
+			advanced: { useHostCookiePrefix: true },
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		// Without isHostPrefix, the cache is not found under its __Host- name.
+		const missed = await getCookieCache(request, {
+			secret: "better-auth.secret",
+		});
+		expect(missed).toBeNull();
+
+		const cache = await getCookieCache(request, {
+			secret: "better-auth.secret",
+			isSecure: true,
+			isHostPrefix: true,
+		});
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
 	});
 
 	it("should respect dontRememberMe when storing session in cookie cache", async () => {

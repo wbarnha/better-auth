@@ -348,6 +348,25 @@ export type BetterAuthAdvancedOptions = {
 	 */
 	useSecureCookies?: boolean | undefined;
 	/**
+	 * Emit cookies with the `__Host-` prefix instead of `__Secure-`,
+	 * whenever cookies are otherwise secure (see `useSecureCookies`). In an
+	 * environment that isn't secure — e.g. local http dev — this has no
+	 * effect and cookies get no prefix, same as `useSecureCookies` unset.
+	 *
+	 * `__Host-` additionally requires that the cookie has no `Domain`
+	 * attribute and uses `Path=/`, which stops a sibling or sub-domain
+	 * from setting a cookie that collides with it. Because of that, this
+	 * cannot be combined with `crossSubDomainCookies.enabled` or
+	 * `useSecureCookies: false`, and cookies cannot override `domain` or
+	 * `path`.
+	 *
+	 * Turning this on renames every auth cookie, so existing sessions are
+	 * signed out — treat it as a breaking, opt-in change.
+	 *
+	 * @default false
+	 */
+	useHostCookiePrefix?: boolean | undefined;
+	/**
 	 * Disable all CSRF protection.
 	 *
 	 * When enabled, this disables:

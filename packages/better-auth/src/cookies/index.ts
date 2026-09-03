@@ -29,6 +29,7 @@ import { sec } from "../utils/time";
 import { isDynamicBaseURLConfig } from "../utils/url";
 import { parseCompactCookieCache, parseCookieCachePayload } from "./cache";
 import {
+	HOST_COOKIE_PREFIX,
 	parseCookies,
 	SECURE_COOKIE_PREFIX,
 	splitSetCookieHeader,
@@ -72,9 +73,30 @@ export function createCookieGetter(options: BetterAuthOptions) {
 					: baseURLString
 						? baseURLString.startsWith("https://")
 						: isProduction;
-	const secureCookiePrefix = secure ? SECURE_COOKIE_PREFIX : "";
+	const useHostCookiePrefix = !!options.advanced?.useHostCookiePrefix;
 	const crossSubdomainEnabled =
 		!!options.advanced?.crossSubDomainCookies?.enabled;
+	if (useHostCookiePrefix) {
+		// Only reject an explicit contradiction. When `secure` is merely
+		// *inferred* false (e.g. local http dev), degrade the same way
+		// `useSecureCookies` already does elsewhere — no prefix at all —
+		// instead of hard-failing every non-https boot.
+		if (options.advanced?.useSecureCookies === false) {
+			throw new BetterAuthError(
+				"advanced.useHostCookiePrefix cannot be combined with advanced.useSecureCookies: false — the __Host- prefix requires the Secure attribute.",
+			);
+		}
+		if (crossSubdomainEnabled) {
+			throw new BetterAuthError(
+				"advanced.useHostCookiePrefix cannot be combined with advanced.crossSubDomainCookies.enabled — the __Host- prefix forbids a Domain attribute.",
+			);
+		}
+	}
+	const secureCookiePrefix = secure
+		? useHostCookiePrefix
+			? HOST_COOKIE_PREFIX
+			: SECURE_COOKIE_PREFIX
+		: "";
 	const domain = crossSubdomainEnabled
 		? options.advanced?.crossSubDomainCookies?.domain ||
 			(baseURLString ? new URL(baseURLString).hostname : undefined)
@@ -99,7 +121,7 @@ export function createCookieGetter(options: BetterAuthOptions) {
 		const attributes =
 			options.advanced?.cookies?.[cookieName]?.attributes ?? {};
 
-		return {
+		const cookie = {
 			name: `${secureCookiePrefix}${name}`,
 			attributes: {
 				secure: !!secureCookiePrefix,
@@ -112,6 +134,17 @@ export function createCookieGetter(options: BetterAuthOptions) {
 				...attributes,
 			},
 		} satisfies BetterAuthCookie;
+
+		if (
+			secureCookiePrefix === HOST_COOKIE_PREFIX &&
+			(cookie.attributes.domain || cookie.attributes.path !== "/")
+		) {
+			throw new BetterAuthError(
+				`Cookie "${cookie.name}" cannot use the __Host- prefix: __Host- cookies must not set a Domain attribute and must use Path=/.`,
+			);
+		}
+
+		return cookie;
 	}
 	return createCookie;
 }
@@ -576,8 +609,9 @@ export const getSessionCookie = (
 	const { cookieName = "session_token", cookiePrefix = "better-auth" } =
 		config || {};
 	const parsedCookie = parseCookies(cookies);
-	// Prefer __Secure- (HTTPS-only) over a non-secure leftover.
+	// Prefer __Host- (strictest), then __Secure- (HTTPS-only), over a non-secure leftover.
 	const getCookie = (name: string) =>
+		parsedCookie.get(`${HOST_COOKIE_PREFIX}${name}`) ??
 		parsedCookie.get(`${SECURE_COOKIE_PREFIX}${name}`) ??
 		parsedCookie.get(name);
 
@@ -600,6 +634,12 @@ export const getCookieCache = async <
 				cookiePrefix?: string;
 				cookieName?: string;
 				isSecure?: boolean;
+				/**
+				 * Set to `true` if the server was configured with
+				 * `advanced.useHostCookiePrefix`, so the cookie is looked up
+				 * under its `__Host-` name instead of `__Secure-`.
+				 */
+				isHostPrefix?: boolean;
 				secret?: string;
 				strategy?: "compact" | "jwt" | "jwe"; // base64-hmac for backward compatibility
 				jwt?:
@@ -632,13 +672,16 @@ export const getCookieCache = async <
 	}
 	const { cookieName = "session_data", cookiePrefix = "better-auth" } =
 		config || {};
+	const securePrefix = config?.isHostPrefix
+		? HOST_COOKIE_PREFIX
+		: SECURE_COOKIE_PREFIX;
 	const name =
 		config?.isSecure !== undefined
 			? config.isSecure
-				? `${SECURE_COOKIE_PREFIX}${cookiePrefix}.${cookieName}`
+				? `${securePrefix}${cookiePrefix}.${cookieName}`
 				: `${cookiePrefix}.${cookieName}`
 			: isProduction
-				? `${SECURE_COOKIE_PREFIX}${cookiePrefix}.${cookieName}`
+				? `${securePrefix}${cookiePrefix}.${cookieName}`
 				: `${cookiePrefix}.${cookieName}`;
 	const parsedCookie = parseCookies(cookies);
 
