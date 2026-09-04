@@ -21,6 +21,7 @@ import {
 	vi,
 } from "vitest";
 import {
+	createCookieGetter,
 	expireCookie,
 	getChunkedCookie,
 	getCookieCache,
@@ -163,6 +164,156 @@ describe("cookies", async () => {
 				},
 			);
 		});
+	});
+});
+
+describe("useHostCookiePrefix", () => {
+	it("emits __Host- prefixed cookies instead of __Secure-", async () => {
+		const { client, testUser } = await getTestInstance({
+			baseURL: "https://example.com",
+			advanced: { useHostCookiePrefix: true },
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toContain(
+						`${HOST_COOKIE_PREFIX}better-auth.session_token`,
+					);
+					expect(setCookie).not.toContain(SECURE_COOKIE_PREFIX);
+					expect(setCookie).toContain("Secure");
+					expect(setCookie).toContain("Path=/");
+					expect(setCookie).not.toContain("Domain=");
+				},
+			},
+		);
+	});
+
+	it("is readable via getSessionCookie", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			baseURL: "https://example.com",
+			advanced: { useHostCookiePrefix: true },
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{ email: testUser.email, password: testUser.password },
+			{ onSuccess: cookieSetter(headers) },
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		expect(getSessionCookie(request)).not.toBeNull();
+	});
+
+	it("throws when useSecureCookies is explicitly disabled", () => {
+		expect(() =>
+			getCookies({
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					useSecureCookies: false,
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(/cannot be combined with advanced\.useSecureCookies: false/);
+	});
+
+	it("degrades to no prefix (instead of throwing) when secure is only inferred false, e.g. local http dev", async () => {
+		const { client, testUser } = await getTestInstance({
+			advanced: { useHostCookiePrefix: true },
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).not.toContain(HOST_COOKIE_PREFIX);
+					expect(setCookie).not.toContain(SECURE_COOKIE_PREFIX);
+					expect(setCookie).toContain("better-auth.session_token");
+				},
+			},
+		);
+	});
+
+	it("throws when combined with crossSubDomainCookies", () => {
+		expect(() =>
+			getCookies({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					crossSubDomainCookies: {
+						enabled: true,
+						domain: "example.com",
+					},
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(/cannot be combined with advanced\.crossSubDomainCookies/);
+	});
+
+	it("throws when a cookie overrides domain or path", () => {
+		expect(() =>
+			getCookies({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					cookies: {
+						session_token: {
+							attributes: { path: "/app" },
+						},
+					},
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(
+			/advanced\.cookies\.session_token\.attributes cannot set a Domain attribute/,
+		);
+	});
+
+	it("throws eagerly for a plugin-only cookie's attributes, not just at first use", () => {
+		// "trust_device" isn't created by getCookies() itself (it's created
+		// lazily by the two-factor plugin on first sign-in) — this proves the
+		// bad config is caught at startup rather than surfacing as an
+		// uncaught error mid-request the first time that cookie is created.
+		expect(() =>
+			createCookieGetter({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					cookies: {
+						trust_device: {
+							attributes: { domain: "example.com" },
+						},
+					},
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(
+			/advanced\.cookies\.trust_device\.attributes cannot set a Domain attribute/,
+		);
+	});
+
+	it("throws eagerly when defaultCookieAttributes overrides domain or path", () => {
+		expect(() =>
+			createCookieGetter({
+				baseURL: "https://example.com",
+				database: {} as BetterAuthOptions["database"],
+				advanced: {
+					useHostCookiePrefix: true,
+					defaultCookieAttributes: { path: "/app" },
+				},
+			} satisfies BetterAuthOptions),
+		).toThrow(
+			/advanced\.defaultCookieAttributes cannot set a Domain attribute/,
+		);
 	});
 });
 
@@ -676,6 +827,58 @@ describe("getSessionCookie", async () => {
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual(testUser.email);
 		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+
+	it("should return cookie cache stored under a __Host- prefixed cookie", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			baseURL: "https://example.com",
+			secret: "better-auth.secret",
+			advanced: { useHostCookiePrefix: true },
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		// Zero-config: auto-detects the __Host- name, same as getSessionCookie.
+		const autoDetected = await getCookieCache(request, {
+			secret: "better-auth.secret",
+		});
+		expect(autoDetected).not.toBeNull();
+		expect(autoDetected?.user?.email).toEqual(testUser.email);
+
+		// isHostPrefix still forces it explicitly.
+		const forced = await getCookieCache(request, {
+			secret: "better-auth.secret",
+			isSecure: true,
+			isHostPrefix: true,
+		});
+		expect(forced).not.toBeNull();
+		expect(forced?.user?.email).toEqual(testUser.email);
+
+		// isSecure: false still opts out of any prefix, even if one is present.
+		const optedOut = await getCookieCache(request, {
+			secret: "better-auth.secret",
+			isSecure: false,
+		});
+		expect(optedOut).toBeNull();
 	});
 
 	it("should respect dontRememberMe when storing session in cookie cache", async () => {

@@ -675,6 +675,7 @@ export const auth = betterAuth({
   * `ipAddressHeaders`: Trusted header names to read client IP addresses from.
   * `trustedProxies`: Reverse-proxy IPs or CIDR ranges. The forwarded chain is walked right to left, trusted hops are skipped, and the first untrusted address is used as the client IP.
 * `useSecureCookies`: By default, cookies are secure in production environments. Set this to `true` to force the `Secure` cookie attribute in all environments.
+* `useHostCookiePrefix`: Emit cookies with the `__Host-` prefix instead of `__Secure-`, whenever cookies are otherwise secure. Cannot be combined with `crossSubDomainCookies.enabled`, `useSecureCookies: false`, or a cookie that overrides `domain`/`path` — these throw at startup. Renames every auth cookie, signing out existing sessions.
 * `disableCSRFCheck`: Disable all CSRF protection including origin header validation and Fetch Metadata checks (⚠️ security risk)
 * `disableOriginCheck`: Disable URL validation for `callbackURL`, `redirectTo`, and other redirect URLs (⚠️ security risk)
 * `crossSubDomainCookies`: Configure cookies to be shared across subdomains
