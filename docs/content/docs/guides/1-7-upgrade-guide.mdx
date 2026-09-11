@@ -345,7 +345,7 @@ The Expo client now uses the asynchronous SecureStore APIs for cookie and sessio
 const cookie = await authClient.getCookie();
 ```
 
-Passing `expo-secure-store` directly continues to work without a wrapper. A custom storage implementation must provide `getItem`, `getItemAsync`, `setItem`, and `setItemAsync`. The exported `storageAdapter.setItem()` method is synchronous; use `setItemAsync()` when the caller must wait for persistence.
+Passing `expo-secure-store` directly continues to work without a wrapper. A custom storage implementation must provide `getItem`, `getItemAsync`, `setItem`, and `setItemAsync`. The exported `storageAdapter.setItem()` method is synchronous; use `setItemAsync()` when the caller must wait for persistence. `setItem()` returns before the value is necessarily stored: if an async write to the same key is already in flight, the sync write is ordered behind it rather than interleaved with it.
 
 ***
 

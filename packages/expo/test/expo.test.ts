@@ -1218,7 +1218,7 @@ describe("expo with cookieCache", async () => {
 			);
 		});
 
-		it("should read the previous value during a chunked overwrite", async () => {
+		it("should read a complete value during a chunked overwrite", async () => {
 			const storage = createAsyncStorage();
 			await storage.setItemAsync("better-auth_cookie", "a".repeat(3_000));
 			const previousValue = "b".repeat(5_000);
@@ -1229,7 +1229,11 @@ describe("expo with cookieCache", async () => {
 			const read = storage.getItemAsync("better-auth_cookie");
 			const [stored] = await Promise.all([read, write]);
 
-			expect(stored).toBe(previousValue);
+			// Issue #11082 asks for "the previous value or the new one, never a
+			// torn or empty read". A read overlapping a write is ordered behind
+			// it and so observes the new value; the guarantee being pinned is
+			// that it is one whole generation rather than a mix of two.
+			expect([previousValue, newValue]).toContain(stored);
 		});
 
 		it("should serialize concurrent chunked overwrites", async () => {
@@ -1332,14 +1336,18 @@ describe("expo with cookieCache", async () => {
 			const asyncValue = "a".repeat(5_000);
 			const error = vi.spyOn(console, "error").mockImplementation(() => {});
 
+			const syncValue = "b".repeat(5_000);
 			const write = asyncStorage.setItemAsync("better-auth_cookie", asyncValue);
-			syncStorage.setItem("better-auth_cookie", "b".repeat(5_000));
+			syncStorage.setItem("better-auth_cookie", syncValue);
 			await write;
 
-			expect(error).toHaveBeenCalledTimes(1);
+			// Ordered behind the pending async write rather than interleaved with
+			// it, and not discarded either: the jar holds one whole value, and it
+			// is the one written last. The read waits for both writes.
+			expect(error).not.toHaveBeenCalled();
 			await expect(
 				asyncStorage.getItemAsync("better-auth_cookie"),
-			).resolves.toBe(asyncValue);
+			).resolves.toBe(syncValue);
 		});
 
 		it("should update a value without losing concurrent changes", async () => {
@@ -1441,6 +1449,45 @@ describe("expo with cookieCache", async () => {
 			expect(getItem).toHaveBeenCalledTimes(1);
 			expect(getItemAsync).toHaveBeenCalledTimes(1);
 		});
+
+		it("should not splice chunks from different writes into one read", async () => {
+			const map = new Map<string, string>();
+			// Reads are slow relative to writes, which is what lets a write land in
+			// the middle of one. The chunk keys a reader walks are only safe from the
+			// first concurrent write: the second targets the slot it started on.
+			const slowRead = async () => {
+				for (let i = 0; i < 10; i++) {
+					await Promise.resolve();
+				}
+			};
+			const backingStorage = {
+				getItem: (name: string) => map.get(name) ?? null,
+				setItem: (name: string, value: string) => map.set(name, value),
+				getItemAsync: async (name: string) => {
+					await slowRead();
+					return map.get(name) ?? null;
+				},
+				setItemAsync: async (name: string, value: string) => {
+					map.set(name, value);
+				},
+			};
+			const storage = storageAdapter(backingStorage);
+			const generation = (marker: string) =>
+				JSON.stringify({ [`better-auth.${marker}`]: marker.repeat(5_000) });
+			const first = generation("a");
+			const second = generation("b");
+			const third = generation("c");
+
+			await storage.setItemAsync("better-auth_cookie", first);
+
+			const read = storage.getItemAsync("better-auth_cookie");
+			await storage.setItemAsync("better-auth_cookie", second);
+			await storage.setItemAsync("better-auth_cookie", third);
+			const value = await read;
+
+			// One complete generation, never chunk 0 of one and chunk 1 of another.
+			expect([first, second, third]).toContain(value);
+		});
 	});
 
 	it("should shrink from chunked to a single value without bleeding stale chunks", () => {
@@ -1458,6 +1505,13 @@ describe("expo with cookieCache", async () => {
 		storage.setItem("better-auth_cookie", "small");
 
 		expect(storage.getItem("better-auth_cookie")).toBe("small");
+		// Reading correctly is not enough: the superseded chunks held a copy of
+		// the old value, and nothing else can ever erase them.
+		const residue = [...map.entries()].filter(
+			([name, value]) =>
+				name.startsWith("better-auth_cookie.") && value.length > 0,
+		);
+		expect(residue).toEqual([]);
 	});
 
 	it("should log instead of throw when the backend rejects a write", async () => {
@@ -1908,7 +1962,9 @@ describe("expo session cache hydration", async () => {
 			([key]) => key === "better-auth_session_data",
 		);
 		expect(sessionAtom.get().data).toEqual(serverSession);
-		expect(sessionCacheReads).toHaveLength(1);
+		// One hydration read shared by both concurrent requests, plus the probe
+		// each cache write makes to find superseded chunks before overwriting.
+		expect(sessionCacheReads).toHaveLength(3);
 	});
 
 	it("preserves additional fields through the cache round-trip", async () => {
@@ -1969,7 +2025,13 @@ describe("expo session cache hydration", async () => {
 
 		getItemAsync.mockClear();
 		await coldStart.getSession();
-		expect(getItemAsync).not.toHaveBeenCalledWith("better-auth_session_data");
+		// Hydration does not run again: `restoreSessionCache` is memoized per
+		// client, so every read of this key here is the probe a cache write makes
+		// to find superseded chunks before overwriting it.
+		const cacheReads = getItemAsync.mock.calls.filter(
+			([key]) => key === "better-auth_session_data",
+		);
+		expect(cacheReads).toHaveLength(2);
 	});
 
 	it.each([
