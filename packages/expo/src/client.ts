@@ -268,8 +268,11 @@ export function normalizeCookieName(name: string) {
 /**
  * Max characters written per `setItem`. Native secure stores silently reject
  * oversized writes (iOS Keychain refuses values above ~2KB), losing the cookie,
- * so a larger value is split across keys here. Mirrors the server's
- * `chunkCookie`/`joinChunks` in `session-store.ts`; keep the two in sync.
+ * so a larger value is split across keys here. The server's
+ * `chunkCookie`/`joinChunks` in `session-store.ts` solves the same problem, but
+ * the two layouts are no longer identical: this one carries a slot and a
+ * fallback count in the marker so an interrupted write is recoverable. What is
+ * worth keeping aligned is the behavior, not the key names.
  *
  * @see https://github.com/better-auth/better-auth/issues/9151
  */
@@ -430,13 +433,69 @@ async function readStoredValueAsync(
 	});
 }
 
+/**
+ * Chunk keys the new value no longer occupies, blanked rather than left behind.
+ *
+ * Mirrors `getCleanCookies` in the server's `session-store.ts`, which expires
+ * superseded chunks for the same reason: a chunk left in place still holds a
+ * readable copy of the value it belonged to. Shrinking a chunked cookie back to
+ * a small one is the case that matters, because signing out writes `"{}"` over
+ * a jar that was chunked, and without this the session token stays in the
+ * keychain afterwards.
+ *
+ * Blanked, not deleted, because `ExpoClientStorage` is four methods of
+ * `SecureStore` and none of them removes a key. Writing `""` erases the
+ * contents, which is the part worth erasing.
+ *
+ * Only the chunks this marker accounts for are cleared. Residue from a
+ * generation older than the marker remembers is not discoverable from here.
+ */
+function getStaleChunkClears(
+	key: string,
+	currentMarker: ChunkMarker | null,
+	next: { slot: ChunkSlot; count: number } | null,
+): [string, string][] {
+	if (currentMarker === null) {
+		return [];
+	}
+	const clears: [string, string][] = [];
+	const clear = (slot: ChunkSlot | null, from: number, to: number) => {
+		for (let i = from; i < to; i++) {
+			clears.push([getChunkKey(key, { ...currentMarker, slot }, i), ""]);
+		}
+	};
+	if (currentMarker.slot === null) {
+		// Legacy layout. Every `key.<i>` is superseded by the slotted write.
+		clear(null, 0, currentMarker.count);
+		return clears;
+	}
+	if (next === null) {
+		// The value fits the base key now, so both slots are superseded.
+		clear(currentMarker.slot, 0, currentMarker.count);
+		if (currentMarker.fallbackCount !== null) {
+			clear(getOtherSlot(currentMarker.slot), 0, currentMarker.fallbackCount);
+		}
+		return clears;
+	}
+	// The write reused the fallback slot. The active slot stays as the recovery
+	// source; only the reused slot's surplus chunks are stale.
+	clear(next.slot, next.count, currentMarker.fallbackCount ?? 0);
+	return clears;
+}
+
 function getStorageWrites(
 	key: string,
 	value: string,
 	currentBaseValue: string | null,
 ): [string, string][] {
+	const currentMarker = currentBaseValue?.startsWith(CHUNK_MARKER)
+		? parseChunkMarker(currentBaseValue)
+		: null;
+
 	if (value.length <= STORAGE_VALUE_LIMIT) {
-		return [[key, value]];
+		// Base key first, so it is the commit point here too: once it holds a
+		// plain value the chunks are unreferenced and clearing them is tidy-up.
+		return [[key, value], ...getStaleChunkClears(key, currentMarker, null)];
 	}
 
 	const count = Math.ceil(value.length / STORAGE_VALUE_LIMIT);
@@ -445,9 +504,6 @@ function getStorageWrites(
 			`Storage value requires ${count} chunks, exceeding the limit of ${MAX_STORAGE_CHUNKS}`,
 		);
 	}
-	const currentMarker = currentBaseValue?.startsWith(CHUNK_MARKER)
-		? parseChunkMarker(currentBaseValue)
-		: null;
 	const slot: ChunkSlot = currentMarker?.slot === 0 ? 1 : 0;
 	const marker: ChunkMarker = {
 		count,
@@ -471,53 +527,175 @@ function getStorageWrites(
 		]);
 	}
 	writes.push([key, serializeChunkMarker(marker)]);
+	// After the commit marker: an interrupted clear leaves the new value intact
+	// and only some superseded chunks still populated.
+	writes.push(...getStaleChunkClears(key, currentMarker, { slot, count }));
 	return writes;
 }
 
-function createKeyedWriteQueue() {
-	const tails = new Map<string, Promise<unknown>>();
-	return {
-		pending(key: string): boolean {
-			return tails.has(key);
-		},
-		enqueue<Result>(
-			key: string,
-			operation: () => Promise<Result>,
-		): Promise<Result> {
-			const previous = tails.get(key) ?? Promise.resolve();
-			const queued = previous.then(operation, operation);
-			tails.set(key, queued);
+/**
+ * A per-key reader/writer lock over the async storage operations.
+ *
+ * The two-slot layout in `getStorageWrites` was built so that reads would stay
+ * lock-free: a write lands in the slot the previous value is not using, then
+ * flips the base marker, so a reader walking chunks is never overwritten
+ * mid-walk. That holds for one write. It does not hold for two, because the
+ * second write alternates back into the slot the first one vacated, which is
+ * the slot a still-running read is walking. The reader then concatenates
+ * chunks from two generations and returns a value that was never stored.
+ *
+ * Issue #11082 asks for "the previous value or the new one, never a torn or
+ * empty read". This is what makes that true in both directions: readers run
+ * concurrently with each other, a write waits for the reads already in flight,
+ * and a read issued while a write is queued waits for it. Reads are no longer
+ * lock-free, which #11099 aimed for, but they were not correct either.
+ *
+ * Sync `getItem` cannot take part: it has nowhere to wait. It reads through the
+ * same fallback path, so it still recovers an interrupted write, but a sync
+ * read racing an async write can still observe a slot mid-rewrite.
+ */
+interface KeyLock {
+	/** Settles when the most recently queued write finishes. */
+	writeTail: Promise<unknown>;
+	/** Reads currently queued or running. Added synchronously, so a write
+	 *  queued after a read always sees it. */
+	reads: Set<Promise<unknown>>;
+	/** Writes queued or running, which is what makes a sync write unsafe. */
+	pendingWrites: number;
+}
 
-			const cleanup = () => {
-				if (tails.get(key) === queued) {
-					tails.delete(key);
-				}
+function createKeyedReadWriteQueue() {
+	const locks = new Map<string, KeyLock>();
+
+	function lockFor(key: string): KeyLock {
+		const existing = locks.get(key);
+		if (existing) {
+			return existing;
+		}
+		const created: KeyLock = {
+			writeTail: Promise.resolve(),
+			reads: new Set(),
+			pendingWrites: 0,
+		};
+		locks.set(key, created);
+		return created;
+	}
+
+	function release(key: string, lock: KeyLock) {
+		if (lock.reads.size === 0 && lock.pendingWrites === 0) {
+			locks.delete(key);
+		}
+	}
+
+	return {
+		pendingWrite(key: string): boolean {
+			return (locks.get(key)?.pendingWrites ?? 0) > 0;
+		},
+		read<Result>(key: string, operation: () => Promise<Result>) {
+			const lock = lockFor(key);
+			const barrier = lock.writeTail;
+			const running = (async () => {
+				// Swallowed, not propagated: a write that failed is logged by the
+				// write itself, and a reader has no stake in it. Letting it through
+				// would turn one failed write into every subsequent read failing.
+				await barrier.catch(() => {});
+				return operation();
+			})();
+			// Registered before the first await resolves, so a write queued later
+			// in this same tick still waits for this read.
+			lock.reads.add(running);
+			const done = () => {
+				lock.reads.delete(running);
+				release(key, lock);
 			};
-			void queued.then(cleanup, cleanup);
-			return queued;
+			void running.then(done, done);
+			return running;
+		},
+		write<Result>(key: string, operation: () => Promise<Result>) {
+			const lock = lockFor(key);
+			const previous = lock.writeTail;
+			// Snapshot rather than re-read: reads queued after this point are
+			// waiting on this write, and draining them here would deadlock.
+			const inFlightReads = [...lock.reads];
+			lock.pendingWrites++;
+			const running = (async () => {
+				await previous.catch(() => {});
+				await Promise.allSettled(inFlightReads);
+				return operation();
+			})();
+			lock.writeTail = running;
+			const done = () => {
+				lock.pendingWrites--;
+				release(key, lock);
+			};
+			void running.then(done, done);
+			return running;
 		},
 	};
 }
 
-const storageWriteQueues = new WeakMap<
+const storageQueues = new WeakMap<
 	ExpoClientStorage,
-	ReturnType<typeof createKeyedWriteQueue>
+	ReturnType<typeof createKeyedReadWriteQueue>
 >();
 
-function getStorageWriteQueue(storage: ExpoClientStorage) {
-	const existing = storageWriteQueues.get(storage);
+function getStorageQueue(storage: ExpoClientStorage) {
+	const existing = storageQueues.get(storage);
 	if (existing) {
 		return existing;
 	}
-	const queue = createKeyedWriteQueue();
-	storageWriteQueues.set(storage, queue);
+	const queue = createKeyedReadWriteQueue();
+	storageQueues.set(storage, queue);
 	return queue;
 }
 
-interface ExpoStorageAdapter {
+/**
+ * The storage surface {@link storageAdapter} exposes. Exported so a consumer
+ * can name the type of a value they hold, rather than reaching for
+ * `ReturnType<typeof storageAdapter>`.
+ */
+export interface ExpoStorageAdapter {
+	/**
+	 * Reads a value, rejoining its chunks when it was stored across several
+	 * keys.
+	 *
+	 * Unlike {@link ExpoStorageAdapter.getItemAsync} this cannot wait, so it is
+	 * not ordered against async writes to the same key. It still recovers an
+	 * interrupted write through the fallback slot; it can still observe a slot
+	 * that a concurrent async write is rewriting. Prefer the async form
+	 * wherever the caller can await.
+	 */
 	getItem(name: string): string | null;
+	/**
+	 * Reads a value, rejoining its chunks when it was stored across several
+	 * keys.
+	 *
+	 * Ordered against writes to the same key: the value is whatever was
+	 * completely stored, never a mix of two writes, and never the empty read
+	 * that an in-progress chunk rewrite would otherwise expose.
+	 */
 	getItemAsync(name: string): Promise<string | null>;
+	/**
+	 * Stores a value, splitting it across chunk keys when it exceeds the
+	 * per-write limit.
+	 *
+	 * Returns before the value is necessarily persisted. When an async write to
+	 * the same key is already queued this one is ordered behind it rather than
+	 * performed inline, because interleaving the two would mix their chunks; the
+	 * value is still written, just not before this returns. Use
+	 * {@link ExpoStorageAdapter.setItemAsync} when the caller must know the
+	 * write landed. Failures are logged rather than thrown, so persistence never
+	 * breaks the request that triggered it.
+	 */
 	setItem(name: string, value: string): void;
+	/**
+	 * Stores a value, splitting it across chunk keys when it exceeds the
+	 * per-write limit, and resolves once it is persisted.
+	 *
+	 * Writes to one key run one at a time and never overlap a read of that key.
+	 * Failures are logged rather than thrown, for the same reason as
+	 * {@link ExpoStorageAdapter.setItem}.
+	 */
 	setItemAsync(name: string, value: string): Promise<void>;
 }
 
@@ -527,7 +705,7 @@ interface StoredUpdate {
 }
 
 function createManagedStorage(storage: ExpoClientStorage) {
-	const writeQueue = getStorageWriteQueue(storage);
+	const operations = getStorageQueue(storage);
 	const logWriteError = (key: string, error: unknown) => {
 		console.error(
 			`[better-auth/expo] failed to persist "${key}" to storage`,
@@ -538,10 +716,15 @@ function createManagedStorage(storage: ExpoClientStorage) {
 		const key = normalizeCookieName(name);
 		return readStoredValue(storage, key, storage.getItem(key));
 	};
-	const getItemAsync = async (name: string): Promise<string | null> => {
+	const getItemAsync = (name: string): Promise<string | null> => {
 		const key = normalizeCookieName(name);
-		const baseValue = await storage.getItemAsync(key);
-		return readStoredValueAsync(storage, key, baseValue);
+		// Queued with the writes, not alongside them. Reading the base marker and
+		// then its chunks is several awaits long, and an unordered read can span
+		// two writes and return chunks from both.
+		return operations.read(key, async () => {
+			const baseValue = await storage.getItemAsync(key);
+			return readStoredValueAsync(storage, key, baseValue);
+		});
 	};
 	const writeItem = (
 		key: string,
@@ -569,43 +752,38 @@ function createManagedStorage(storage: ExpoClientStorage) {
 			await storage.setItemAsync(writeKey, writeValue);
 		}
 	};
-	const setItem = (name: string, value: string): void => {
-		const key = normalizeCookieName(name);
-		if (writeQueue.pending(key)) {
-			logWriteError(
-				key,
-				new Error("Cannot write synchronously while an async write is pending"),
-			);
-			return;
-		}
-		try {
-			const currentBaseValue =
-				value.length > STORAGE_VALUE_LIMIT ? storage.getItem(key) : null;
-			writeItem(key, value, currentBaseValue);
-		} catch (error) {
-			logWriteError(key, error);
-		}
-	};
 	const setItemAsync = (name: string, value: string): Promise<void> => {
 		const key = normalizeCookieName(name);
-		return writeQueue.enqueue(key, async () => {
+		return operations.write(key, async () => {
 			try {
-				const currentBaseValue =
-					value.length > STORAGE_VALUE_LIMIT
-						? await storage.getItemAsync(key)
-						: null;
-				await writeItemAsync(key, value, currentBaseValue);
+				await writeItemAsync(key, value, await storage.getItemAsync(key));
 			} catch (error) {
 				logWriteError(key, error);
 			}
 		});
+	};
+	const setItem = (name: string, value: string): void => {
+		const key = normalizeCookieName(name);
+		if (operations.pendingWrite(key)) {
+			// Writing synchronously here would interleave these chunks with the
+			// queued write's. Order it behind them instead of dropping it: this
+			// returns before the value lands, which `setItemAsync` is the way to
+			// wait on, but the value is never silently lost.
+			void setItemAsync(name, value);
+			return;
+		}
+		try {
+			writeItem(key, value, storage.getItem(key));
+		} catch (error) {
+			logWriteError(key, error);
+		}
 	};
 	const updateItemAsync = (
 		name: string,
 		update: (currentValue: string | null) => string,
 	): Promise<StoredUpdate | null> => {
 		const key = normalizeCookieName(name);
-		return writeQueue.enqueue(key, async () => {
+		return operations.write(key, async () => {
 			try {
 				const currentBaseValue = await storage.getItemAsync(key);
 				const previousValue = await readStoredValueAsync(
@@ -627,8 +805,12 @@ function createManagedStorage(storage: ExpoClientStorage) {
 }
 
 /**
- * Wraps Expo storage with chunking, recoverable writes, and serialized async
- * updates.
+ * Wraps Expo storage with chunking, recoverable writes, and reads and writes
+ * that are ordered against each other per key.
+ *
+ * Coordination is scoped to the storage object passed in, so two adapters over
+ * the same backing store only coordinate when handed the same object. Reuse one
+ * object across clients that share stored data.
  */
 export function storageAdapter(storage: ExpoClientStorage): ExpoStorageAdapter {
 	const managedStorage = createManagedStorage(storage);
